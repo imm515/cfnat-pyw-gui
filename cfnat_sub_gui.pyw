@@ -83,10 +83,49 @@ subscription_locked = False      # 订阅IP是否已锁定
 SUBSCRIPTION_LOCK_THRESHOLD = 10 # 刷新次数达到此值后锁定订阅IP
 
 # cfnat日志保存
-save_cfnat_log = True  # 默认开启日志保存
+save_cfnat_log = False  # 默认关闭日志保存
 cfnat_log_file = None
 CFNAT_LOG_DIR = "logs"
 CFNAT_LOG_KEEP_DAYS = 2
+
+
+def load_subscription_ip_from_cache():
+    """
+    从订阅缓存文件中恢复订阅IP
+    返回: IP地址或None
+    """
+    sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+    if not os.path.exists(sub_path):
+        return None
+    
+    try:
+        with open(sub_path, 'r', encoding='utf-8') as f:
+            cached_content = f.read().strip()
+        
+        if not cached_content:
+            return None
+        
+        # Base64解码
+        decoded = base64.b64decode(cached_content).decode('utf-8')
+        
+        # 按行分割，查找第一个有效IP
+        ip_pattern = re.compile(r'@((\d{1,3}(?:\.\d{1,3}){3}):\d+')
+        
+        for line in decoded.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            match = ip_pattern.search(line)
+            if match:
+                ip = match.group(1)
+                # 跳过本地地址
+                if ip not in ('127.0.0.1', '0.0.0.0', 'localhost'):
+                    return ip
+        
+        return None
+    except Exception as e:
+        return None
 
 
 def init_cfnat_log():
@@ -669,47 +708,44 @@ def update_ip_refresh_count(ip, delay=None):
     return ip_refresh_counts[ip]
 
 
-def get_most_stable_ip():
-    global ip_refresh_counts
-    if not ip_refresh_counts:
-        return None
-    return max(ip_refresh_counts.items(), key=lambda x: x[1])[0]
-
-
 def update_subscription_if_needed():
     """
-    检查并更新订阅IP到最稳定的IP
-    策略：当订阅IP刷新次数达到10次后，锁定订阅IP，不再切换
-    返回: (是否更新了, 最稳定IP)
+    检查并更新订阅IP
+    策略：IP切换后，等待新IP刷新10次才切换订阅并锁定
+    返回: (是否更新了, 当前IP, 旧订阅IP)
     """
-    global subscription_ip, ip_refresh_counts, subscription_locked
+    global subscription_ip, ip_refresh_counts, subscription_locked, current_ip
     
     # 如果订阅已锁定，不再更新
     if subscription_locked:
-        return (False, subscription_ip)
+        return (False, subscription_ip, None)
     
-    most_stable_ip = get_most_stable_ip()
+    # 优先使用当前cfnat选定的IP
+    target_ip = current_ip
     
-    if most_stable_ip is None:
-        return (False, None)
+    if target_ip is None:
+        return (False, None, None)
     
-    if most_stable_ip == subscription_ip:
-        # 检查是否达到锁定阈值
-        refresh_count = ip_refresh_counts.get(subscription_ip, 0)
-        if refresh_count >= SUBSCRIPTION_LOCK_THRESHOLD:
+    # 检查当前IP的刷新次数
+    current_refresh_count = ip_refresh_counts.get(target_ip, 0)
+    
+    if target_ip == subscription_ip:
+        # 当前IP已经是订阅IP，检查是否达到锁定阈值
+        if current_refresh_count >= SUBSCRIPTION_LOCK_THRESHOLD:
             subscription_locked = True
-            return (False, subscription_ip)
-        return (False, most_stable_ip)
+            return (False, target_ip, None)
+        return (False, target_ip, None)
     
-    old_sub_ip = subscription_ip
-    subscription_ip = most_stable_ip
+    # 当前IP与订阅IP不同
+    # 只有在新IP刷新次数达到阈值后才切换订阅
+    if current_refresh_count >= SUBSCRIPTION_LOCK_THRESHOLD:
+        old_sub_ip = subscription_ip
+        subscription_ip = target_ip
+        subscription_locked = True  # 达到阈值后立即锁定
+        return (True, target_ip, old_sub_ip)
     
-    # 检查是否达到锁定阈值
-    refresh_count = ip_refresh_counts.get(subscription_ip, 0)
-    if refresh_count >= SUBSCRIPTION_LOCK_THRESHOLD:
-        subscription_locked = True
-    
-    return (True, most_stable_ip, old_sub_ip)
+    # 新IP刷新次数不足，不切换订阅
+    return (False, target_ip, None)
 
 
 def should_show_log():
@@ -1010,12 +1046,13 @@ def cfnat_worker(args):
         captured_data = []
         ip_refresh_counts = {}
         ip_delays = {}
-        subscription_ip = None
+        # 不再重置 subscription_ip，保留上一轮的历史订阅IP
+        # 新扫描开始时解锁订阅，允许新IP在达到10次后切换
+        subscription_locked = False
         last_refresh_ip = None
         ip_exhausted_history = []
         last_log_time = 0
         valid_ip_count = 0
-        subscription_locked = False
         
         cfnat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CFNAT_BIN)
         if not os.path.exists(cfnat_path):
@@ -1060,6 +1097,7 @@ def cfnat_worker(args):
         last_progress_line = ""
         last_refresh_line = ""
         scan_start_time = time.time()
+        ip_exhausted_logged = False  # 本轮扫描是否已记录过IP耗尽
         
         try:
             creationflags = 0
@@ -1093,6 +1131,7 @@ def cfnat_worker(args):
                 if validity_start_pattern.search(line):
                     if not validity_started:
                         validity_started = True
+                        ip_exhausted_logged = False  # 进入优选模式时重置IP耗尽记录标志
                         gui_print(f"")
                         gui_print(f"{'='*60}")
                         gui_print(f"[优选模式] 扫描完成，进入IP优选阶段")
@@ -1170,14 +1209,17 @@ def cfnat_worker(args):
                     continue
                 
                 if all_ip_exhausted_pattern.search(line):
-                    gui_print(f"")
-                    gui_print(f"[IP耗尽] 将重新扫描...")
-                    check_result = check_ip_exhausted()
-                    if check_result == 'retry':
-                        continue
-                    elif check_result:
-                        running = False
-                        break
+                    # 防止同一轮扫描重复记录IP耗尽
+                    if not ip_exhausted_logged:
+                        ip_exhausted_logged = True
+                        gui_print(f"")
+                        gui_print(f"[IP耗尽] 将重新扫描...")
+                        check_result = check_ip_exhausted()
+                        if check_result == 'retry':
+                            continue
+                        elif check_result:
+                            running = False
+                            break
                     validity_started = False
                     continue
                 
@@ -1217,33 +1259,54 @@ def cfnat_worker(args):
                                 gui_print(refresh_line)
                             last_refresh_line = refresh_line
                         
-                        most_stable = get_most_stable_ip()
-                        if most_stable:
-                            stable_count = ip_refresh_counts.get(most_stable, 0)
-                            stable_delay = ip_delays.get(most_stable, '---')
+                        # 显示当前cfnat使用的IP信息和订阅状态
+                        if current_ip:
+                            current_refresh_count = ip_refresh_counts.get(current_ip, 0)
+                            current_delay_val = ip_delays.get(current_ip, '---')
                             gui_print(f"")
-                            gui_print(f"[当前优选] 最稳定IP: {most_stable} | 延迟 {stable_delay}ms | 刷新次数 {stable_count}")
-                            if subscription_locked:
-                                gui_print(f"[订阅策略] 已锁定（刷新次数达{SUBSCRIPTION_LOCK_THRESHOLD}次），订阅IP固定")
+                            gui_print(f"[当前使用] IP: {current_ip} | 延迟 {current_delay_val}ms | 刷新次数 {current_refresh_count}")
+                            # 显示当前订阅IP（可能与current_ip不同）
+                            if subscription_ip:
+                                sub_delay = ip_delays.get(subscription_ip, '---')
+                                sub_count = ip_refresh_counts.get(subscription_ip, 0)
+                                if subscription_locked:
+                                    gui_print(f"[订阅锁定] {subscription_ip} | 延迟 {sub_delay}ms | 刷新 {sub_count}次 | cfnat继续优选但订阅固定")
+                                elif subscription_ip != current_ip:
+                                    # 当前使用IP与订阅IP不同，显示新IP还需多少次才切换
+                                    remaining = SUBSCRIPTION_LOCK_THRESHOLD - current_refresh_count
+                                    if remaining > 0:
+                                        gui_print(f"[订阅候选] {current_ip} | 延迟 {current_delay_val}ms | 刷新 {current_refresh_count}次 | 还需{remaining}次刷新后切换订阅")
+                                    else:
+                                        gui_print(f"[订阅候选] {current_ip} | 延迟 {current_delay_val}ms | 刷新 {current_refresh_count}次 | 即将切换订阅")
+                                    # 历史订阅IP，本轮刷新次数可能为0
+                                    count_str = f"本轮{sub_count}次" if sub_count > 0 else "历史订阅"
+                                    gui_print(f"[订阅当前] {subscription_ip} | 延迟 {sub_delay}ms | {count_str}")
+                                else:
+                                    remaining = SUBSCRIPTION_LOCK_THRESHOLD - sub_count
+                                    if remaining > 0:
+                                        gui_print(f"[订阅状态] 还需{remaining}次刷新后锁定")
+                                    else:
+                                        gui_print(f"[订阅状态] 已达到锁定阈值，即将锁定")
                             else:
-                                remaining = SUBSCRIPTION_LOCK_THRESHOLD - stable_count
+                                # 首次运行，无历史订阅IP
+                                remaining = SUBSCRIPTION_LOCK_THRESHOLD - current_refresh_count
                                 if remaining > 0:
-                                    gui_print(f"[订阅策略] 还需{remaining}次刷新后锁定")
+                                    gui_print(f"[订阅状态] 等待首次锁定（还需{remaining}次刷新）")
                         
                         update_result = update_subscription_if_needed()
                         if update_result[0]:
-                            most_stable = update_result[1]
+                            new_sub_ip = update_result[1]
                             old_sub_ip = update_result[2]
-                            generate_subscription([most_stable])
+                            generate_subscription([new_sub_ip])
                             gui_print(f"")
                             if old_sub_ip:
                                 old_count = ip_refresh_counts.get(old_sub_ip, 0)
-                                new_count = ip_refresh_counts.get(most_stable, 0)
-                                gui_print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {most_stable}({new_count}次)")
+                                new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                gui_print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {new_sub_ip}({new_count}次)")
                             else:
-                                stable_count = ip_refresh_counts.get(most_stable, 0)
-                                stable_delay = ip_delays.get(most_stable, '---')
-                                gui_print(f"[订阅更新] ✓ 首次订阅IP: {most_stable} | 延迟 {stable_delay}ms | 刷新次数 {stable_count}")
+                                new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                new_delay = ip_delays.get(new_sub_ip, '---')
+                                gui_print(f"[订阅更新] ✓ 首次订阅IP: {new_sub_ip} | 延迟 {new_delay}ms | 刷新次数 {new_count}")
                     continue
                 
                 best_match = best_conn_pattern.search(line)
@@ -1271,18 +1334,18 @@ def cfnat_worker(args):
                         
                         update_result = update_subscription_if_needed()
                         if update_result[0]:
-                            most_stable = update_result[1]
+                            new_sub_ip = update_result[1]
                             old_sub_ip = update_result[2]
-                            generate_subscription([most_stable])
+                            generate_subscription([new_sub_ip])
                             gui_print(f"")
                             if old_sub_ip:
                                 old_count = ip_refresh_counts.get(old_sub_ip, 0)
-                                new_count = ip_refresh_counts.get(most_stable, 0)
-                                gui_print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {most_stable}({new_count}次)")
+                                new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                gui_print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {new_sub_ip}({new_count}次)")
                             else:
-                                stable_count = ip_refresh_counts.get(most_stable, 0)
-                                stable_delay = ip_delays.get(most_stable, '---')
-                                gui_print(f"[订阅更新] ✓ 首次订阅IP: {most_stable} | 延迟 {stable_delay}ms | 刷新次数 {stable_count}")
+                                new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                new_delay = ip_delays.get(new_sub_ip, '---')
+                                gui_print(f"[订阅更新] ✓ 首次订阅IP: {new_sub_ip} | 延迟 {new_delay}ms | 刷新次数 {new_count}")
                         last_best_ip = ip
                     continue
                 
@@ -1397,8 +1460,8 @@ class CfnatGUI:
         self.stop_btn = ttk.Button(btn_frame, text="停止扫描", command=self.stop_cfnat, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         
-        # 日志保存选项（默认开启）
-        self.save_log_var = tk.BooleanVar(value=True)
+        # 日志保存选项
+        self.save_log_var = tk.BooleanVar(value=save_cfnat_log)
         self.save_log_check = ttk.Checkbutton(btn_frame, text="保存cfnat日志", variable=self.save_log_var, command=self.toggle_save_log)
         self.save_log_check.pack(side=tk.LEFT, padx=15)
         
@@ -1693,12 +1756,13 @@ def cfnat_worker_cli(args):
         captured_data = []
         ip_refresh_counts = {}
         ip_delays = {}
-        subscription_ip = None
+        # 不再重置 subscription_ip，保留上一轮的历史订阅IP
+        # 新扫描开始时解锁订阅，允许新IP在达到10次后切换
+        subscription_locked = False
         last_refresh_ip = None
         ip_exhausted_history = []
         last_log_time = 0
         valid_ip_count = 0
-        subscription_locked = False
         
         cfnat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CFNAT_BIN)
         if not os.path.exists(cfnat_path):
@@ -1741,6 +1805,7 @@ def cfnat_worker_cli(args):
         last_progress_pct = -1
         last_refresh_line = ""
         scan_start_time = time.time()
+        ip_exhausted_logged = False  # 本轮扫描是否已记录过IP耗尽
         
         try:
             creationflags = 0
@@ -1771,6 +1836,7 @@ def cfnat_worker_cli(args):
                 if validity_start_pattern.search(line):
                     if not validity_started:
                         validity_started = True
+                        ip_exhausted_logged = False  # 进入优选模式时重置IP耗尽记录标志
                         sys.stdout.write("\n")
                         sys.stdout.flush()
                         print(f"{'='*60}")
@@ -1840,13 +1906,16 @@ def cfnat_worker_cli(args):
                     continue
                 
                 if all_ip_exhausted_pattern.search(line):
-                    print(f"\n[IP耗尽] 将重新扫描...")
-                    check_result = check_ip_exhausted_cli()
-                    if check_result == 'retry':
-                        continue
-                    elif check_result:
-                        running = False
-                        break
+                    # 防止同一轮扫描重复记录IP耗尽
+                    if not ip_exhausted_logged:
+                        ip_exhausted_logged = True
+                        print(f"\n[IP耗尽] 将重新扫描...")
+                        check_result = check_ip_exhausted_cli()
+                        if check_result == 'retry':
+                            continue
+                        elif check_result:
+                            running = False
+                            break
                     validity_started = False
                     continue
                 
@@ -1881,33 +1950,54 @@ def cfnat_worker_cli(args):
                             print(refresh_line, end='', flush=True)
                             last_refresh_line = refresh_line
                         
-                        most_stable = get_most_stable_ip()
-                        if most_stable:
-                            stable_count = ip_refresh_counts.get(most_stable, 0)
-                            stable_delay = ip_delays.get(most_stable, '---')
+                        # 显示当前cfnat使用的IP信息和订阅状态
+                        if current_ip:
+                            current_refresh_count = ip_refresh_counts.get(current_ip, 0)
+                            current_delay_val = ip_delays.get(current_ip, '---')
                             print(f"")
-                            print(f"[当前优选] 最稳定IP: {most_stable} | 延迟 {stable_delay}ms | 刷新次数 {stable_count}")
-                            if subscription_locked:
-                                print(f"[订阅策略] 已锁定（刷新次数达{SUBSCRIPTION_LOCK_THRESHOLD}次），订阅IP固定")
+                            print(f"[当前使用] IP: {current_ip} | 延迟 {current_delay_val}ms | 刷新次数 {current_refresh_count}")
+                            # 显示当前订阅IP（可能与current_ip不同）
+                            if subscription_ip:
+                                sub_delay = ip_delays.get(subscription_ip, '---')
+                                sub_count = ip_refresh_counts.get(subscription_ip, 0)
+                                if subscription_locked:
+                                    print(f"[订阅锁定] {subscription_ip} | 延迟 {sub_delay}ms | 刷新 {sub_count}次 | cfnat继续优选但订阅固定")
+                                elif subscription_ip != current_ip:
+                                    # 当前使用IP与订阅IP不同，显示新IP还需多少次才切换
+                                    remaining = SUBSCRIPTION_LOCK_THRESHOLD - current_refresh_count
+                                    if remaining > 0:
+                                        print(f"[订阅候选] {current_ip} | 延迟 {current_delay_val}ms | 刷新 {current_refresh_count}次 | 还需{remaining}次刷新后切换订阅")
+                                    else:
+                                        print(f"[订阅候选] {current_ip} | 延迟 {current_delay_val}ms | 刷新 {current_refresh_count}次 | 即将切换订阅")
+                                    # 历史订阅IP，本轮刷新次数可能为0
+                                    count_str = f"本轮{sub_count}次" if sub_count > 0 else "历史订阅"
+                                    print(f"[订阅当前] {subscription_ip} | 延迟 {sub_delay}ms | {count_str}")
+                                else:
+                                    remaining = SUBSCRIPTION_LOCK_THRESHOLD - sub_count
+                                    if remaining > 0:
+                                        print(f"[订阅状态] 还需{remaining}次刷新后锁定")
+                                    else:
+                                        print(f"[订阅状态] 已达到锁定阈值，即将锁定")
                             else:
-                                remaining = SUBSCRIPTION_LOCK_THRESHOLD - stable_count
+                                # 首次运行，无历史订阅IP
+                                remaining = SUBSCRIPTION_LOCK_THRESHOLD - current_refresh_count
                                 if remaining > 0:
-                                    print(f"[订阅策略] 还需{remaining}次刷新后锁定")
+                                    print(f"[订阅状态] 等待首次锁定（还需{remaining}次刷新）")
                         
                         update_result = update_subscription_if_needed()
                         if update_result[0]:
-                            most_stable = update_result[1]
+                            new_sub_ip = update_result[1]
                             old_sub_ip = update_result[2]
-                            generate_subscription_cli([most_stable])
+                            generate_subscription_cli([new_sub_ip])
                             print(f"")
                             if old_sub_ip:
                                 old_count = ip_refresh_counts.get(old_sub_ip, 0)
-                                new_count = ip_refresh_counts.get(most_stable, 0)
-                                print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {most_stable}({new_count}次)")
+                                new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {new_sub_ip}({new_count}次)")
                             else:
-                                stable_count = ip_refresh_counts.get(most_stable, 0)
-                                stable_delay = ip_delays.get(most_stable, '---')
-                                print(f"[订阅更新] ✓ 首次订阅IP: {most_stable} | 延迟 {stable_delay}ms | 刷新次数 {stable_count}")
+                                new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                new_delay = ip_delays.get(new_sub_ip, '---')
+                                print(f"[订阅更新] ✓ 首次订阅IP: {new_sub_ip} | 延迟 {new_delay}ms | 刷新次数 {new_count}")
                     continue
                 
                 best_match = best_conn_pattern.search(line)
@@ -1932,18 +2022,18 @@ def cfnat_worker_cli(args):
                         
                         update_result = update_subscription_if_needed()
                         if update_result[0]:
-                            most_stable = update_result[1]
+                            new_sub_ip = update_result[1]
                             old_sub_ip = update_result[2]
-                            generate_subscription_cli([most_stable])
+                            generate_subscription_cli([new_sub_ip])
                             print(f"")
                             if old_sub_ip:
                                 old_count = ip_refresh_counts.get(old_sub_ip, 0)
-                                new_count = ip_refresh_counts.get(most_stable, 0)
-                                print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {most_stable}({new_count}次)")
+                                new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                print(f"[订阅切换] ✓ {old_sub_ip}({old_count}次) → {new_sub_ip}({new_count}次)")
                             else:
-                                stable_count = ip_refresh_counts.get(most_stable, 0)
-                                stable_delay = ip_delays.get(most_stable, '---')
-                                print(f"[订阅更新] ✓ 首选IP: {most_stable} | 延迟 {stable_delay}ms | 刷新次数 {stable_count}")
+                                new_count = ip_refresh_counts.get(new_sub_ip, 0)
+                                new_delay = ip_delays.get(new_sub_ip, '---')
+                                print(f"[订阅更新] ✓ 首选IP: {new_sub_ip} | 延迟 {new_delay}ms | 刷新次数 {new_count}")
                         last_best_ip = ip
                     continue
             
@@ -1972,7 +2062,10 @@ def cfnat_worker_cli(args):
                 break
         finally:
             if cfnat_proc:
-                cfnat_proc.wait(timeout=5)
+                try:
+                    cfnat_proc.wait(timeout=5)
+                except:
+                    cfnat_proc.kill()
                 cfnat_proc = None
         
         if not running:
@@ -2099,6 +2192,8 @@ def generate_subscription_cli(ips=None, sort_by_delay=True, silent=False):
 
 
 def main():
+    global subscription_ip, subscription_locked, save_cfnat_log, cfnat_log_file
+    
     if not check_single_instance():
         print("[错误] 程序已在运行")
         try:
@@ -2110,11 +2205,17 @@ def main():
     
     load_location_data()
     
-    # 默认开启日志保存，启动时初始化日志文件
-    global save_cfnat_log, cfnat_log_file
+    # 尝试从缓存文件恢复订阅IP
+    cached_ip = load_subscription_ip_from_cache()
+    if cached_ip:
+        subscription_ip = cached_ip
+        subscription_locked = True  # 恢复的IP视为已锁定
+        print(f"[订阅恢复] 从缓存恢复订阅IP: {cached_ip}")
+    
+    # 日志保存开关，启动时初始化日志文件
     if save_cfnat_log:
         cfnat_log_file = init_cfnat_log()
-        print(f"[日志] 已自动启用cfnat日志保存: {cfnat_log_file}")
+        print(f"[日志] 已启用cfnat日志保存: {cfnat_log_file}")
     
     try:
         if len(sys.argv) > 1:
