@@ -83,7 +83,7 @@ subscription_locked = False      # 订阅IP是否已锁定
 SUBSCRIPTION_LOCK_THRESHOLD = 10 # 刷新次数达到此值后锁定订阅IP
 
 # cfnat日志保存
-save_cfnat_log = False
+save_cfnat_log = True  # 默认开启日志保存
 cfnat_log_file = None
 CFNAT_LOG_DIR = "logs"
 CFNAT_LOG_KEEP_DAYS = 2
@@ -136,11 +136,64 @@ def clean_old_logs(log_dir):
 
 
 def write_cfnat_log(line):
-    """写入一行日志到cfnat日志文件"""
+    """写入一行日志到cfnat日志文件，智能过滤扫描过程中的刷屏信息"""
     global cfnat_log_file, save_cfnat_log
     
     if not save_cfnat_log or not cfnat_log_file:
         return
+    
+    # 处理扫描进度行 - 只记录关键百分比节点
+    progress_match = re.search(r'已完成:\s*(\d+)\s+总数:\s*(\d+)', line)
+    if progress_match:
+        done, total = int(progress_match.group(1)), int(progress_match.group(2))
+        if total > 0:
+            pct = int(done / total * 100)
+            # 只记录：开头(0%)、每25%、结尾(100%)
+            if pct == 0 or pct >= 100 or pct % 25 == 0:
+                # 避免重复记录同一百分比
+                pct_key = f"log_pct_{pct}"
+                if getattr(write_cfnat_log, pct_key, None) != total:
+                    setattr(write_cfnat_log, pct_key, total)
+                    try:
+                        with open(cfnat_log_file, 'a', encoding='utf-8') as f:
+                            f.write(f"[扫描进度] {pct}% ({done}/{total})\n")
+                    except:
+                        pass
+        return
+    
+    # 处理发现有效IP行 - 只记录前3个和最后1个
+    valid_ip_match = re.search(r'发现有效IP\s+(\d+\.\d+\.\d+\.\d+)\s+位置信息\s+(.+?)\s+延迟\s+(\d+)', line)
+    if valid_ip_match:
+        ip, location, delay = valid_ip_match.groups()
+        # 使用计数器控制记录数量
+        if not hasattr(write_cfnat_log, 'valid_ip_count'):
+            write_cfnat_log.valid_ip_count = 0
+        write_cfnat_log.valid_ip_count += 1
+        count = write_cfnat_log.valid_ip_count
+        # 只记录前3个，其他跳过
+        if count <= 3:
+            try:
+                with open(cfnat_log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"[发现IP-{count}] {ip} ({location}) 延迟{delay}ms\n")
+            except:
+                pass
+        return
+    
+    # 扫描完成时重置计数器并记录总数
+    if '成功提取' in line and '个有效IP' in line:
+        if hasattr(write_cfnat_log, 'valid_ip_count'):
+            total_found = write_cfnat_log.valid_ip_count
+            write_cfnat_log.valid_ip_count = 0
+            # 清除百分比标记
+            for attr in list(write_cfnat_log.__dict__.keys() if hasattr(write_cfnat_log, '__dict__') else []):
+                if attr.startswith('log_pct_'):
+                    delattr(write_cfnat_log, attr)
+            try:
+                with open(cfnat_log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"[扫描完成] 共发现 {total_found} 个有效IP\n")
+            except:
+                pass
+            return
     
     try:
         with open(cfnat_log_file, 'a', encoding='utf-8') as f:
@@ -1344,8 +1397,8 @@ class CfnatGUI:
         self.stop_btn = ttk.Button(btn_frame, text="停止扫描", command=self.stop_cfnat, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         
-        # 日志保存选项
-        self.save_log_var = tk.BooleanVar(value=False)
+        # 日志保存选项（默认开启）
+        self.save_log_var = tk.BooleanVar(value=True)
         self.save_log_check = ttk.Checkbutton(btn_frame, text="保存cfnat日志", variable=self.save_log_var, command=self.toggle_save_log)
         self.save_log_check.pack(side=tk.LEFT, padx=15)
         
@@ -2056,6 +2109,12 @@ def main():
         return
     
     load_location_data()
+    
+    # 默认开启日志保存，启动时初始化日志文件
+    global save_cfnat_log, cfnat_log_file
+    if save_cfnat_log:
+        cfnat_log_file = init_cfnat_log()
+        print(f"[日志] 已自动启用cfnat日志保存: {cfnat_log_file}")
     
     try:
         if len(sys.argv) > 1:
