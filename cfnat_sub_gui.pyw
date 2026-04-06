@@ -102,6 +102,7 @@ SPEEDTEST_DURATION = 5.0
 SPEEDTEST_WINDOW = 0.5
 TLS_PORTS = {443, 2053, 2083, 2087, 2096, 8443}
 subscription_speedtest_running = False
+log_last_line_replaceable = False
 
 
 def validate_ip(ip_str):
@@ -460,12 +461,14 @@ def gui_print(msg):
 
 
 def _gui_print_impl(msg):
+    global log_last_line_replaceable
     if gui_app and gui_app.log_text:
         try:
             gui_app.log_text.configure(state='normal')
             gui_app.log_text.insert(tk.END, msg + '\n')
             gui_app.log_text.see(tk.END)
             gui_app.log_text.configure(state='disabled')
+            log_last_line_replaceable = False
         except:
             pass
 
@@ -480,14 +483,42 @@ def gui_print_replace(msg):
         print(msg)
 
 
+def gui_print_refresh(msg):
+    if gui_app and gui_app.log_text:
+        try:
+            gui_app.root.after(0, lambda: _gui_print_refresh_impl(msg))
+        except:
+            print(msg)
+    else:
+        print(msg)
+
+
 def _gui_print_replace_impl(msg):
+    global log_last_line_replaceable
     if gui_app and gui_app.log_text:
         try:
             gui_app.log_text.configure(state='normal')
-            gui_app.log_text.delete("end-2l", "end-1l")
+            if log_last_line_replaceable:
+                gui_app.log_text.delete("end-2l", "end-1l")
             gui_app.log_text.insert(tk.END, msg + '\n')
             gui_app.log_text.see(tk.END)
             gui_app.log_text.configure(state='disabled')
+            log_last_line_replaceable = True
+        except:
+            pass
+
+
+def _gui_print_refresh_impl(msg):
+    global log_last_line_replaceable
+    if gui_app and gui_app.log_text:
+        try:
+            gui_app.log_text.configure(state='normal')
+            if log_last_line_replaceable:
+                gui_app.log_text.delete("end-2l", "end-1l")
+            gui_app.log_text.insert(tk.END, msg + '\n')
+            gui_app.log_text.see(tk.END)
+            gui_app.log_text.configure(state='disabled')
+            log_last_line_replaceable = True
         except:
             pass
 
@@ -1511,10 +1542,7 @@ def cfnat_worker(args):
                         speed = done_int / elapsed if elapsed > 0 else 0
                         remaining = (total_int - done_int) / speed if speed > 0 else 0
                         progress_line = f"[扫描] {pct_int}% | {ip_count}个IP | {int(speed)}/秒 | 剩余{int(remaining)}秒"
-                        if last_progress_line:
-                            gui_print_replace(progress_line)
-                        else:
-                            gui_print(progress_line)
+                        gui_print_refresh(progress_line)
                         last_progress_line = progress_line
                     continue
                 
@@ -1576,10 +1604,7 @@ def cfnat_worker(args):
                             old_count = ip_refresh_counts.get(old_ip, 0) if old_ip else 0
                             current_delay = ip_delays.get(new_ip, '---')
                             refresh_line = f"[IP切换] {old_ip or '---'} → {new_ip} | 延迟: {current_delay}ms | 刷新次数: {refresh_count}"
-                            if last_refresh_line:
-                                gui_print_replace(refresh_line)
-                            else:
-                                gui_print(refresh_line)
+                            gui_print_refresh(refresh_line)
                             last_refresh_line = refresh_line
                         
                         # 显示当前cfnat使用的IP信息和订阅状态
@@ -1646,11 +1671,8 @@ def cfnat_worker(args):
                         refresh_line = f"[IP刷新] {ip} | 延迟: {current_delay}ms | 刷新次数: {refresh_count}"
                         
                         # 同一行更新
-                        if last_refresh_line:
-                            gui_print_replace(refresh_line)
-                        else:
-                            gui_print(refresh_line)
-                            last_refresh_line = refresh_line
+                        gui_print_refresh(refresh_line)
+                        last_refresh_line = refresh_line
                         
                         if ip != current_ip:
                             old_ip = current_ip
