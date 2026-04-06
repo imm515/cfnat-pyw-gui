@@ -12,6 +12,7 @@ import http.server
 import socketserver
 import threading
 import socket
+import ssl
 import sys
 import os
 import time
@@ -94,6 +95,13 @@ save_cfnat_log = False  # 默认关闭日志保存
 cfnat_log_file = None
 CFNAT_LOG_DIR = "logs"
 CFNAT_LOG_KEEP_DAYS = 2
+SPEEDTEST_URL = "speed.cloudflare.com/__down?bytes=10000000"
+SPEEDTEST_CONNECT_TIMEOUT = 5
+SPEEDTEST_READ_TIMEOUT = 5
+SPEEDTEST_DURATION = 5.0
+SPEEDTEST_WINDOW = 0.5
+TLS_PORTS = {443, 2053, 2083, 2087, 2096, 8443}
+subscription_speedtest_running = False
 
 
 def validate_ip(ip_str):
@@ -928,6 +936,214 @@ def build_vmess_url(node):
     return f"vmess://{b64_data}"
 
 
+def normalize_speedtest_url(test_url):
+    return test_url.replace(
+        "speed.cloudflare.com/__down?bytes=100000000",
+        "speed.cloudflare.com/__down?bytes=10000000"
+    ).replace(
+        "speed.cloudflare.com/__down?bytes=50000000",
+        "speed.cloudflare.com/__down?bytes=10000000"
+    )
+
+
+def load_cached_subscription_content():
+    sub_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SUBSCRIPTION_FILE)
+    if not os.path.exists(sub_path):
+        return ""
+    try:
+        with open(sub_path, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def decode_subscription_lines(content):
+    if not content:
+        return []
+    try:
+        decoded = base64.b64decode(content).decode('utf-8')
+    except Exception:
+        return []
+    return [line.strip() for line in decoded.splitlines() if line.strip()]
+
+
+def parse_subscription_nodes(content):
+    nodes = []
+    for line in decode_subscription_lines(content):
+        node = None
+        if line.startswith('vless://'):
+            node = parse_vless_url(line)
+        elif line.startswith('vmess://'):
+            node = parse_vmess_url(line)
+        if node:
+            node['raw'] = line
+            nodes.append(node)
+    return nodes
+
+
+def get_node_ip(node):
+    if node['type'] == 'vless':
+        return node.get('ip', '')
+    if node['type'] == 'vmess':
+        return str(node.get('data', {}).get('add', '')).strip()
+    return ''
+
+
+def get_node_port(node):
+    if node['type'] == 'vless':
+        return int(node.get('port', 0) or 0)
+    if node['type'] == 'vmess':
+        return int(node.get('data', {}).get('port', 0) or 0)
+    return 0
+
+
+def get_subscription_speedtest_target():
+    target_ip = subscription_ip or load_subscription_ip_from_cache()
+    if not target_ip:
+        return None, "当前没有可测速的订阅IP"
+
+    cached_content = load_cached_subscription_content()
+    nodes = parse_subscription_nodes(cached_content)
+    if not nodes:
+        nodes = parse_subscription_nodes(generate_subscription([target_ip], silent=True))
+
+    for node in nodes:
+        node_ip = get_node_ip(node)
+        node_port = get_node_port(node)
+        if node_ip == target_ip and node_port > 0:
+            return {
+                'ip': target_ip,
+                'port': node_port,
+                'scheme': 'https' if node_port in TLS_PORTS else 'http'
+            }, None
+
+    return {
+        'ip': target_ip,
+        'port': 443,
+        'scheme': 'https'
+    }, None
+
+
+def open_speedtest_stream(target_ip, target_port, scheme):
+    test_url = SPEEDTEST_URL
+    if not test_url.startswith('http://') and not test_url.startswith('https://'):
+        test_url = scheme + '://' + test_url
+    test_url = normalize_speedtest_url(test_url)
+
+    parsed = urlparse(test_url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise RuntimeError("测速地址解析失败")
+
+    path = parsed.path or '/'
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    sock = socket.create_connection((target_ip, target_port), timeout=SPEEDTEST_CONNECT_TIMEOUT)
+    sock.settimeout(SPEEDTEST_READ_TIMEOUT)
+
+    conn = sock
+    if scheme == 'https':
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        conn = context.wrap_socket(sock, server_hostname=hostname)
+        conn.settimeout(SPEEDTEST_READ_TIMEOUT)
+
+    request_data = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {hostname}\r\n"
+        "User-Agent: Mozilla/5.0\r\n"
+        "Accept: */*\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode('ascii')
+    conn.sendall(request_data)
+
+    response = b''
+    while b'\r\n\r\n' not in response:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+        if len(response) > 65536:
+            break
+
+    if b'\r\n\r\n' not in response:
+        conn.close()
+        raise RuntimeError("测速响应头读取失败")
+
+    header, body = response.split(b'\r\n\r\n', 1)
+    status_line = header.split(b'\r\n', 1)[0].decode('iso-8859-1', errors='ignore')
+    parts = status_line.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        conn.close()
+        raise RuntimeError("测速响应状态异常")
+
+    status_code = int(parts[1])
+    if status_code != 200:
+        conn.close()
+        raise RuntimeError(f"测速返回 HTTP {status_code}")
+
+    return conn, len(body)
+
+
+def run_subscription_speedtest(target_ip, target_port, scheme):
+    start = time.time()
+    conn, initial_body_bytes = open_speedtest_stream(target_ip, target_port, scheme)
+    total_bytes = int(initial_body_bytes)
+    max_speed = 0.0
+    window_bytes = int(initial_body_bytes)
+    window_start = start
+    deadline = start + SPEEDTEST_DURATION
+
+    try:
+        while time.time() < deadline:
+            now = time.time()
+            if window_bytes > 0 and now - window_start >= SPEEDTEST_WINDOW:
+                current_speed = float(window_bytes) / (now - window_start) / 1024 / 1024
+                if current_speed > max_speed:
+                    max_speed = current_speed
+                window_bytes = 0
+                window_start = now
+
+            try:
+                chunk = conn.recv(32 * 1024)
+            except socket.timeout:
+                break
+
+            now = time.time()
+            if not chunk:
+                break
+
+            read_bytes = len(chunk)
+            total_bytes += read_bytes
+            window_bytes += read_bytes
+
+            if window_bytes > 0 and now - window_start >= SPEEDTEST_WINDOW:
+                current_speed = float(window_bytes) / (now - window_start) / 1024 / 1024
+                if current_speed > max_speed:
+                    max_speed = current_speed
+                window_bytes = 0
+                window_start = now
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if window_bytes > 0:
+        window_duration = max(time.time() - window_start, 0.001)
+        current_speed = float(window_bytes) / window_duration / 1024 / 1024
+        if current_speed > max_speed:
+            max_speed = current_speed
+
+    if max_speed == 0 and total_bytes > 0:
+        total_duration = max(time.time() - start, 0.001)
+        max_speed = float(total_bytes) / total_duration / 1024 / 1024
+
+    return f"{max_speed:.2f} MB/s"
+
+
 def load_template():
     global current_template
     if current_template:
@@ -1585,6 +1801,9 @@ class CfnatGUI:
         
         self.manual_ip_btn = ttk.Button(btn_frame, text="手动IP启动", command=self.start_with_manual_ip)
         self.manual_ip_btn.pack(side=tk.LEFT, padx=5)
+
+        self.subscription_speedtest_btn = ttk.Button(btn_frame, text="测速当前订阅", command=self.start_subscription_speedtest)
+        self.subscription_speedtest_btn.pack(side=tk.LEFT, padx=5)
         
         self.restart_btn = ttk.Button(btn_frame, text="重启扫描", command=self.restart_cfnat, state=tk.DISABLED)
         self.restart_btn.pack(side=tk.LEFT, padx=5)
@@ -1824,6 +2043,37 @@ class CfnatGUI:
         
         gui_print(f"[状态] 订阅服务运行中，关闭窗口可停止服务...")
     
+    def start_subscription_speedtest(self):
+        global subscription_speedtest_running
+
+        if subscription_speedtest_running:
+            gui_print("[订阅测速] 正在测速中，请等待当前任务完成")
+            return
+
+        target, err = get_subscription_speedtest_target()
+        if err:
+            messagebox.showwarning("订阅测速", err)
+            return
+
+        subscription_speedtest_running = True
+        self.subscription_speedtest_btn.configure(state=tk.DISABLED)
+        threading.Thread(target=self.subscription_speedtest_worker, args=(target,), daemon=True).start()
+
+    def subscription_speedtest_worker(self, target):
+        global subscription_speedtest_running
+
+        try:
+            gui_print("")
+            gui_print(f"[订阅测速] 开始测速: {target['ip']}:{target['port']}")
+            gui_print("[订阅测速] 已忽略系统代理，直连目标IP，测速文件 10MB")
+            speed = run_subscription_speedtest(target['ip'], target['port'], target['scheme'])
+            gui_print(f"[订阅测速] 结果: {speed} | IP {target['ip']} | 端口 {target['port']}")
+        except Exception as e:
+            gui_print(f"[订阅测速] 失败: {e}")
+        finally:
+            subscription_speedtest_running = False
+            self.root.after(0, lambda: self.subscription_speedtest_btn.configure(state=tk.NORMAL))
+
     def stop_cfnat(self):
         global running, cfnat_proc
         running = False
