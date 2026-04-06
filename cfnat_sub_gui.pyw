@@ -23,7 +23,7 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import ipaddress
 
-CFNAT_BIN = "cfnat-windows7-amd64.exe"
+CFNAT_BIN = "cfdata-cli-win7-experimental.exe"
 NODES_FILE = "nodes.txt"
 SUBSCRIPTION_FILE = "subscription.txt"
 LOCATION_CACHE_FILE = "location_cache.json"
@@ -324,12 +324,12 @@ def kill_existing_cfnat():
     if sys.platform == 'win32':
         try:
             result = subprocess.run(
-                ['tasklist', '/FI', 'IMAGENAME eq cfnat-windows7-amd64.exe', '/FO', 'CSV', '/NH'],
+                ['tasklist', '/FI', f'IMAGENAME eq {CFNAT_BIN}', '/FO', 'CSV', '/NH'],
                 capture_output=True, text=True, encoding='gbk', errors='replace'
             )
             lines = result.stdout.strip().split('\n')
             for line in lines:
-                if 'cfnat-windows7-amd64.exe' in line:
+                if CFNAT_BIN in line:
                     parts = line.split(',')
                     if len(parts) >= 2:
                         pid = parts[1].strip('"')
